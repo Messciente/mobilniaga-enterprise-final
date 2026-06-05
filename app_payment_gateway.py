@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import os
 import html
 from pathlib import Path
 
 import pandas as pd
-import requests
 import streamlit as st
-from dotenv import load_dotenv
 
+from db_common import query, one, execute
 from ui_style import setup_page, hero, kpi, money, section, df_table, info_card, status_badge
 
-# Fallback supaya tidak error kalau fungsi ini belum ada di ui_style.py
 try:
     from ui_style import demo_credentials, sidebar_brand, sidebar_user
 except Exception:
@@ -34,7 +31,7 @@ except Exception:
                     Password: <code>{html.escape(password)}</code>
                 </div>
                 """,
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -46,7 +43,7 @@ except Exception:
                 <p style="margin:6px 0 0;color:#64748b">{html.escape(subtitle)}</p>
             </div>
             """,
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
 
     def sidebar_user(name, subtitle=""):
@@ -63,12 +60,27 @@ except Exception:
                 <span style="font-size:.86rem;color:#64748b">{html.escape(str(subtitle))}</span>
             </div>
             """,
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
+
+
+ROOT = Path(__file__).resolve().parent
+
+MASTER_DB = "mobilniaga_master"
+PAYMENT_DB = "payment_gateway_db"
+
+setup_page("MobilNiaga Payment Gateway", "💳")
+
+CREDS = {
+    "FIN-DANA": ("dana@mobilniaga.id", "dana123"),
+    "FIN-BANK": ("bank@mobilniaga.id", "bank123"),
+    "FIN-GOPAY": ("gopay@mobilniaga.id", "gopay123"),
+}
 
 
 def step_pills(items, active_index=0):
     pills = ""
+
     for i, item in enumerate(items):
         active = "active" if i == active_index else ""
         pills += f"<span class='step-pill {active}'>{i + 1}. {html.escape(item)}</span>"
@@ -128,52 +140,196 @@ def step_pills(items, active_index=0):
         </style>
         <div class="step-wrap">{pills}</div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
 
 def safe_get(row, key, default=""):
     try:
         value = row.get(key, default)
+
         if pd.isna(value):
             return default
+
         return value
     except Exception:
         return default
 
 
-ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
+def get_providers_df() -> pd.DataFrame:
+    rows = query(
+        MASTER_DB,
+        """
+        SELECT
+            partner_code AS provider_code,
+            partner_name AS provider_name,
+            partner_type,
+            city,
+            status,
+            brand_color
+        FROM partners
+        WHERE partner_type = 'FINTECH'
+        ORDER BY partner_name
+        """,
+    )
 
-API = os.getenv("PAYMENT_API_URL", "http://127.0.0.1:8003")
-
-setup_page("MobilNiaga Payment Gateway", "💳")
-
-CREDS = {
-    "FIN-DANA": ("dana@mobilniaga.id", "dana123"),
-    "FIN-BANK": ("bank@mobilniaga.id", "bank123"),
-    "FIN-GOPAY": ("gopay@mobilniaga.id", "gopay123"),
-}
-
-
-def get(path):
-    try:
-        response = requests.get(API + path, timeout=20)
-        response.raise_for_status()
-        return response.json()
-    except Exception:
-        st.error(
-            "Payment API belum aktif. Jalankan: "
-            "python -m uvicorn payment_api:app --port 8003 --reload"
-        )
-        return []
+    return pd.DataFrame(rows)
 
 
-def post(path, payload):
-    response = requests.post(API + path, json=payload, timeout=20)
-    if not response.ok:
-        raise RuntimeError(response.text)
-    return response.json()
+def login_provider(provider_code: str, email: str, password: str):
+    default_email, default_password = CREDS.get(provider_code, ("", ""))
+
+    if email != default_email or password != default_password:
+        return None
+
+    provider = one(
+        MASTER_DB,
+        """
+        SELECT
+            partner_code AS provider_code,
+            partner_name AS provider_name,
+            partner_type AS provider_type,
+            city,
+            status,
+            brand_color
+        FROM partners
+        WHERE partner_code = %s
+          AND partner_type = 'FINTECH'
+        """,
+        (provider_code,),
+    )
+
+    if not provider:
+        return None
+
+    return {
+        "provider": provider,
+        "user": {
+            "email": email,
+            "role": "PAYMENT_ADMIN",
+        },
+    }
+
+
+def get_payments_df(provider_code: str) -> pd.DataFrame:
+    rows = query(
+        PAYMENT_DB,
+        """
+        SELECT
+            transaction_global_id,
+            order_global_id,
+            provider_code,
+            customer_name,
+            amount,
+            fee,
+            net_amount,
+            payment_status,
+            risk_score,
+            payment_channel,
+            virtual_account,
+            qris_code,
+            customer_instruction,
+            expires_at,
+            created_at
+        FROM payment_transactions
+        WHERE provider_code = %s
+        ORDER BY created_at DESC
+        """,
+        (provider_code,),
+    )
+
+    return pd.DataFrame(rows)
+
+
+def get_settlements_df(provider_code: str) -> pd.DataFrame:
+    rows = query(
+        MASTER_DB,
+        """
+        SELECT
+            settlement_id,
+            order_global_id,
+            seller_code,
+            provider_code,
+            gross_amount,
+            marketplace_fee,
+            seller_net_amount,
+            settlement_status,
+            created_at
+        FROM settlements
+        WHERE provider_code = %s
+        ORDER BY created_at DESC
+        """,
+        (provider_code,),
+    )
+
+    return pd.DataFrame(rows)
+
+
+def confirm_payment_transaction(transaction_global_id: str, provider_code: str) -> str:
+    trx = one(
+        PAYMENT_DB,
+        """
+        SELECT *
+        FROM payment_transactions
+        WHERE transaction_global_id = %s
+          AND provider_code = %s
+        """,
+        (transaction_global_id, provider_code),
+    )
+
+    if not trx:
+        raise RuntimeError("Transaksi tidak ditemukan untuk provider ini.")
+
+    if trx.get("payment_status") == "PAID":
+        return "Transaksi ini sudah berstatus PAID."
+
+    execute(
+        PAYMENT_DB,
+        """
+        UPDATE payment_transactions
+        SET payment_status = 'PAID'
+        WHERE transaction_global_id = %s
+          AND provider_code = %s
+        """,
+        (transaction_global_id, provider_code),
+    )
+
+    execute(
+        MASTER_DB,
+        """
+        UPDATE payments_summary
+        SET payment_status = 'PAID',
+            paid_at = NOW()
+        WHERE payment_reference = %s
+          AND provider_code = %s
+        """,
+        (transaction_global_id, provider_code),
+    )
+
+    execute(
+        MASTER_DB,
+        """
+        UPDATE orders
+        SET payment_status = 'PAID',
+            order_status = CASE
+                WHEN order_status = 'WAITING_PAYMENT' THEN 'PAYMENT_CONFIRMED'
+                ELSE order_status
+            END
+        WHERE order_global_id = %s
+        """,
+        (trx["order_global_id"],),
+    )
+
+    execute(
+        MASTER_DB,
+        """
+        INSERT INTO order_status_history(order_global_id, status, note, created_at)
+        VALUES (%s, 'PAYMENT_CONFIRMED', 'Payment gateway mengonfirmasi pembayaran menjadi PAID.', NOW())
+        """,
+        (trx["order_global_id"],),
+    )
+
+    return "Pembayaran berhasil dikonfirmasi oleh payment gateway."
 
 
 if "payment_auth" not in st.session_state:
@@ -186,16 +342,23 @@ if "payment_auth" not in st.session_state:
 if not st.session_state.payment_auth:
     hero(
         "Payment Gateway Center",
-        "DANA, Bank Kirana, dan GoPay login masing-masing. VA/QRIS dan transaksi difilter sesuai provider yang aktif."
+        "DANA, Bank Kirana, dan GoPay login masing-masing. VA/QRIS dan transaksi difilter sesuai provider yang aktif.",
     )
 
     step_pills(
         ["Login provider", "Lihat transaksi", "Verifikasi bayar", "Pantau VA/QRIS", "Settlement"],
-        active_index=0
+        active_index=0,
     )
 
-    providers = pd.DataFrame(get("/providers"))
+    try:
+        providers = get_providers_df()
+    except Exception as exc:
+        st.error("Database belum siap. Pastikan Streamlit Secrets dan schema database sudah benar.")
+        st.code(str(exc))
+        st.stop()
+
     if providers.empty:
+        st.info("Belum ada data payment provider di database.")
         st.stop()
 
     c1, c2 = st.columns([0.9, 1.1])
@@ -213,17 +376,12 @@ if not st.session_state.payment_auth:
         password = st.text_input("Password", value=default_password, type="password")
 
         if st.button("Masuk Payment Center", type="primary", use_container_width=True):
-            try:
-                st.session_state.payment_auth = post(
-                    "/auth/login",
-                    {
-                        "provider_code": code,
-                        "email": email,
-                        "password": password,
-                    }
-                )
+            auth = login_provider(code, email, password)
+
+            if auth:
+                st.session_state.payment_auth = auth
                 st.rerun()
-            except Exception:
+            else:
                 st.error("Login provider gagal. Cek provider, email, dan password.")
 
         st.markdown("</div>", unsafe_allow_html=True)
@@ -235,13 +393,13 @@ if not st.session_state.payment_auth:
                 ("QRIS / Wallet", "DANA Digital Wallet", "dana@mobilniaga.id", "dana123"),
                 ("Virtual Account", "Bank Kirana Digital", "bank@mobilniaga.id", "bank123"),
                 ("QRIS / Wallet", "GoPay Financial Services", "gopay@mobilniaga.id", "gopay123"),
-            ]
+            ],
         )
 
         info_card(
             "Akses payment terpisah",
             "DANA hanya melihat transaksi DANA/QRIS, Bank Kirana melihat Virtual Account, dan GoPay melihat transaksi GoPay/QRIS.",
-            "🔐"
+            "🔐",
         )
 
     st.stop()
@@ -268,7 +426,7 @@ with st.sidebar:
             "Settlement",
             "Profil Provider",
         ],
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
 
     st.markdown("---")
@@ -281,17 +439,16 @@ with st.sidebar:
 hero(
     provider["provider_name"],
     "Monitor pembayaran, VA/QRIS, konfirmasi transaksi, dan settlement provider.",
-    f"linear-gradient(120deg,{provider.get('brand_color', '#2563eb')},#e0f2fe,#fff)"
+    f"linear-gradient(120deg,{provider.get('brand_color', '#2563eb')},#e0f2fe,#fff)",
 )
 
-payments = pd.DataFrame(get("/payments"))
-settlements = pd.DataFrame(get("/settlements"))
-
-if not payments.empty:
-    payments = payments[payments.provider_code == code]
-
-if not settlements.empty:
-    settlements = settlements[settlements.provider_code == code]
+try:
+    payments = get_payments_df(code)
+    settlements = get_settlements_df(code)
+except Exception as exc:
+    st.error("Data payment gagal dimuat. Cek schema database dan Secrets.")
+    st.code(str(exc))
+    st.stop()
 
 
 # =========================================================
@@ -312,17 +469,18 @@ if page == "Dashboard":
         kpi("Paid", paid_count, "berhasil")
 
     with c4:
-        volume = payments.amount.sum() if not payments.empty else 0
+        volume = payments.amount.sum() if not payments.empty and "amount" in payments else 0
         kpi("Volume", money(volume), "gross payment")
 
-    if not payments.empty:
+    if not payments.empty and "created_at" in payments.columns:
         daily = (
-            payments
-            .assign(day=pd.to_datetime(payments.created_at).dt.date)
+            payments.assign(day=pd.to_datetime(payments.created_at).dt.date)
             .groupby("day", as_index=False)["amount"]
             .sum()
         )
         st.line_chart(daily.set_index("day"))
+    else:
+        st.info("Belum ada transaksi untuk divisualisasikan.")
 
 
 # =========================================================
@@ -338,20 +496,18 @@ elif page == "Transaksi Masuk":
             if col in show.columns:
                 show[col] = show[col].apply(money)
 
-        df_table(
-            show[
-                [
-                    "transaction_global_id",
-                    "order_global_id",
-                    "customer_name",
-                    "payment_channel",
-                    "amount",
-                    "fee",
-                    "payment_status",
-                    "created_at",
-                ]
-            ]
-        )
+        cols = [
+            "transaction_global_id",
+            "order_global_id",
+            "customer_name",
+            "payment_channel",
+            "amount",
+            "fee",
+            "payment_status",
+            "created_at",
+        ]
+
+        df_table(show[[c for c in cols if c in show.columns]])
     else:
         st.info("Belum ada transaksi untuk provider ini.")
 
@@ -374,17 +530,17 @@ elif page == "Konfirmasi Pembayaran":
             "Detail transaksi",
             f"""
             Order: <b>{row.order_global_id}</b><br>
-            Customer: {row.customer_name}<br>
+            Customer: {html.escape(str(row.customer_name))}<br>
             Nominal: <b>{money(row.amount)}</b><br>
-            Metode: {row.payment_channel}
+            Metode: {html.escape(str(row.payment_channel))}
             """,
-            "💳"
+            "💳",
         )
 
         if st.button("Konfirmasi pembayaran", type="primary"):
             try:
-                result = post("/payments/confirm", {"transaction_global_id": transaction_id})
-                st.success(result["message"])
+                message = confirm_payment_transaction(transaction_id, code)
+                st.success(message)
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
@@ -408,11 +564,11 @@ elif page == "VA / QRIS":
                 "Pembayaran",
                 f"""
                 Order: <b>{row.order_global_id}</b><br>
-                Customer: {row.customer_name}<br>
+                Customer: {html.escape(str(row.customer_name))}<br>
                 Total: <b>{money(row.amount)}</b><br>
                 Status: {status_badge(row.payment_status)}
                 """,
-                "🧾"
+                "🧾",
             )
 
         with c2:
@@ -428,7 +584,7 @@ elif page == "VA / QRIS":
                     Bayar tepat: <b>{money(row.amount)}</b>
                     """,
                     "🏦",
-                    "pay-box"
+                    "pay-box",
                 )
             else:
                 st.markdown(
@@ -444,7 +600,7 @@ elif page == "VA / QRIS":
                         <small>Nominal {money(row.amount)}</small>
                     </div>
                     """,
-                    unsafe_allow_html=True
+                    unsafe_allow_html=True,
                 )
 
 
@@ -457,7 +613,7 @@ elif page == "Settlement":
     show = settlements.copy()
 
     if not show.empty:
-        for col in ["gross_amount", "fee_amount", "net_settlement"]:
+        for col in ["gross_amount", "marketplace_fee", "seller_net_amount"]:
             if col in show.columns:
                 show[col] = show[col].apply(money)
 
@@ -480,5 +636,5 @@ elif page == "Profil Provider":
         Tipe: {provider.get("provider_type", "-")}<br>
         Status: {provider.get("status", "ACTIVE")}
         """,
-        "🏦"
+        "🏦",
     )
