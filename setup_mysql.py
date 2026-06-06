@@ -26,7 +26,15 @@ for line in raw.splitlines():
 if buf:
     statements.append("\n".join(buf).strip())
 
-conn = pymysql.connect(host=host, port=port, user=user, password=password, charset="utf8mb4", autocommit=True)
+conn = pymysql.connect(
+    host=host,
+    port=port,
+    user=user,
+    password=password,
+    charset="utf8mb4",
+    autocommit=True,
+    ssl={"ssl": {}}
+)
 try:
     with conn.cursor() as cur:
         for st in statements:
