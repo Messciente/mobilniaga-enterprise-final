@@ -132,36 +132,47 @@ def seller_vehicle_codes(seller_code: str) -> list[str]:
 
 def get_inventory_df(seller_code: str) -> pd.DataFrame:
     db = seller_db_name(seller_code)
-    has_seller_code = table_has_column(db, "seller_inventory", "seller_code")
+    codes = seller_vehicle_codes(seller_code)
 
-    if has_seller_code:
+    if codes:
+        placeholders = ",".join(["%s"] * len(codes))
+        rows = query(
+            db,
+            f"""
+            SELECT 
+                v.*,
+                i.inventory_id,
+                i.stock_available,
+                i.reserved_stock,
+                i.warehouse,
+                i.last_updated
+            FROM vehicles v
+            LEFT JOIN seller_inventory i 
+                ON i.vehicle_code = v.vehicle_code
+            WHERE v.vehicle_code IN ({placeholders})
+            ORDER BY v.brand, v.model
+            """,
+            tuple(codes),
+        )
+    else:
         rows = query(
             db,
             """
-            SELECT *
-            FROM seller_inventory
-            WHERE seller_code = %s
-            ORDER BY brand, model
+            SELECT 
+                v.*,
+                i.inventory_id,
+                i.stock_available,
+                i.reserved_stock,
+                i.warehouse,
+                i.last_updated
+            FROM vehicles v
+            LEFT JOIN seller_inventory i 
+                ON i.vehicle_code = v.vehicle_code
+            WHERE v.seller_code = %s
+            ORDER BY v.brand, v.model
             """,
-            (seller_code,)
+            (seller_code,),
         )
-    else:
-        codes = seller_vehicle_codes(seller_code)
-
-        if codes:
-            placeholders = ",".join(["%s"] * len(codes))
-            rows = query(
-                db,
-                f"""
-                SELECT *
-                FROM seller_inventory
-                WHERE vehicle_code IN ({placeholders})
-                ORDER BY brand, model
-                """,
-                tuple(codes)
-            )
-        else:
-            rows = []
 
     return pd.DataFrame(rows)
 
